@@ -1,62 +1,51 @@
-import Bot from "../models/bot.model.js";
+import axios from "axios";
+import dotenv from "dotenv";
 import User from "../models/user.js";
-import user from "../models/user.js";
+import Bot from "../models/bot.model.js";
+
+dotenv.config();
+
+const BIGMODEL_KEY = process.env.BIGMODEL_API_KEY;
+const BIGMODEL_URL = process.env.BIGMODEL_BASE_URL + "/api/paas/v4/chat/completions";
 
 export const message = async (req, res) => {
   try {
     const { text } = req.body;
-    if (!text?.trim()) {
-      res.status(400).json({ error: "message cont be empty" });
-    }
-    const user = await User.create({
-      sender: "user",
-      text,
-    });
-    const botresponses = {
-      hello: "Hi there! How can I assist you today?",
-      "how are you": "I'm just a bot, but I'm doing great! How about you?",
-      "what is your name":
-        "I'm your friendly AI assistant created by Hussain 🤖",
-      "what can you do":
-        "I can answer your questions and help you with basic information.",
-      "what is html":
-        "HTML stands for HyperText Markup Language and is used to create web pages.",
-      "what is css":
-        "CSS stands for Cascading Style Sheets and is used to style web pages.",
-      "what is javascript":
-        "JavaScript is a programming language used to make web pages interactive.",
-      "what is react":
-        "React is a JavaScript library for building user interfaces, created by Facebook.",
-      "what is node js":
-        "Node.js is a runtime environment that allows JavaScript to run on the server side.",
-      "what is express js":
-        "Express is a minimal and flexible Node.js web framework for building APIs.",
-      "what is mongodb":
-        "MongoDB is a NoSQL database that stores data in JSON-like documents.",
-      "what is api":
-        "API stands for Application Programming Interface. It allows communication between software systems.",
-      "what is frontend":
-        "Frontend is the part of a website that users interact with directly.",
-      "what is backend":
-        "Backend refers to the server-side logic, databases, and APIs that power applications.",
-      "what is full stack":
-        "Full stack development involves both frontend and backend technologies.",
-      "who created you":
-        "I was created by Hussain while learning how to build chatbots!",
-      "thank you": "You're welcome! 😊",
-      bye: "Goodbye! Have a nice day 🌸",
-    };
-    const normalize=text.toLowerCase().trim()
-    const botresponse=botresponses[normalize]||"sorry i don't understand that"
-    const bot=await Bot.create({
-        text:botresponse
-    })
-    return res.status(200).json({
-        userMessage:user.text,
-        botMessage:bot.text
-    })
+
+    if (!text?.trim()) return res.status(400).json({ error: "Message cannot be empty" });
+
+   
+    const userMessage = await User.create({ sender: "user", text });
+
+ 
+    const response = await axios.post(
+      BIGMODEL_URL,
+      {
+        model: "glm-4.6",  
+        messages: [
+          { role: "system", content: "You are a helpful and friendly AI chatbot." },
+          { role: "user", content: text }
+        ],
+        temperature: 0.6,
+        max_tokens: 1024
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${BIGMODEL_KEY}`
+        }
+      }
+    );
+
+    const botReply = response.data.choices?.[0]?.message?.content || "متاسفم، پاسخی دریافت نشد.";
+
+    // ذخیره پاسخ ربات
+    const botMessage = await Bot.create({ sender: "bot", text: botReply });
+
+    res.status(200).json({ userMessage: userMessage.text, botMessage: botMessage.text });
+
   } catch (error) {
-    console.log("message error")
-    res.status(500).json({error:"internal server error"})
+    console.error("AI message error:", error.response?.data || error.message);
+    res.status(500).json({ error: "Internal server error" });
   }
 };
