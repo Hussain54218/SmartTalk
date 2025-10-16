@@ -1,88 +1,96 @@
+// backend/routes/bot.routes.js
 import express from "express";
-import axios from "axios";
 import dotenv from "dotenv";
+import { request } from "undici";
 import User from "../models/user.js";
 import Bot from "../models/bot.model.js";
 
 dotenv.config();
 const router = express.Router();
+
 const BIGMODEL_KEY = process.env.BIGMODEL_API_KEY;
 const BIGMODEL_URL = process.env.BIGMODEL_BASE_URL + "/api/paas/v4/chat/completions";
 
-// گرفتن پیام‌های قبلی
-const getMessageHistory = async () => {
-  const userMsgs = await User.find().sort({ createdAt: 1 });
-  const botMsgs = await Bot.find().sort({ createdAt: 1 });
-  const allMsgs = [];
-
-  let i = 0, j = 0;
-  while (i < userMsgs.length || j < botMsgs.length) {
-    if (i < userMsgs.length) {
-      allMsgs.push({ role: "user", content: userMsgs[i].text });
-      i++;
-    }
-    if (j < botMsgs.length) {
-      allMsgs.push({ role: "assistant", content: botMsgs[j].text });
-      j++;
-    }
-  }
-  return allMsgs;
-};
-
-// ارسال پیام به ربات
-router.post("/message", async (req, res) => {
+// SSE stream endpoint
+router.get("/message/stream", async (req, res) => {
   try {
-    const { text } = req.body;
-    if (!text?.trim()) return res.status(400).json({ error: "پیام نمی‌تواند خالی باشد" });
+    const text = req.query.text;
+    if (!text?.trim()) return res.status(400).json({ error: "Message cannot be empty" });
+
+    // Set SSE headers
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("Access-Control-Allow-Origin", "*");
 
     // ذخیره پیام کاربر
-    const userMessage = await User.create({ text, sender: "user" });
+    await User.create({ sender: "user", text });
 
-    // تاریخچه پیام‌ها
-    const messagesHistory = await getMessageHistory();
-
-    // پیام برای API
     const messagesForAPI = [
-      { role: "system", content: "You are a helpful AI assistant. پاسخ‌ها را به فارسی و انگلیسی روان بده." },
-      ...messagesHistory,
-      { role: "user", content: text }
+      { role: "system", content: "You are a helpful assistant. پاسخ‌ها را به فارسی و انگلیسی بده." },
+      { role: "user", content: text },
     ];
 
-    // درخواست به BigModel
-    const response = await axios.post(BIGMODEL_URL, {
-      model: "glm-4.6",
-      messages: messagesForAPI,
-      temperature: 0.7,
-      top_p: 0.9,
-      max_tokens: 1024
-    }, {
+    // ارسال درخواست به BigModel
+    const response = await request(BIGMODEL_URL, {
+      method: "POST",
       headers: {
+        "Authorization": `Bearer ${BIGMODEL_KEY}`,
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${BIGMODEL_KEY}`
-      }
+      },
+      body: JSON.stringify({
+        model: "glm-4.6",
+        messages: messagesForAPI,
+        stream: true,
+      }),
     });
 
-    const botReply = response.data.choices?.[0]?.message?.content || "متاسفم، پاسخی دریافت نشد.";
+    let fullText = "";
+    let buffer = "";
+    const decoder = new TextDecoder();
 
-    // ذخیره پاسخ ربات
-    const botMessage = await Bot.create({ text: botReply, sender: "bot" });
+    for await (const chunk of response.body) {
+      buffer += decoder.decode(chunk, { stream: true });
 
-    res.status(200).json({ userMessage: userMessage.text, botMessage: botMessage.text });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop(); // بقیه برای chunk بعدی
+
+      for (const part of parts) {
+        if (!part.startsWith("data:")) continue;
+
+        const dataStr = part.replace(/^data:\s*/, '');
+        if (!dataStr || dataStr === "[DONE]") {
+          if (fullText.trim()) await Bot.create({ sender: "bot", text: fullText });
+          res.write(`data: ${JSON.stringify({ type: "done", content: fullText })}\n\n`);
+          res.end();
+          return;
+        }
+
+        try {
+          const json = JSON.parse(dataStr);
+          const token = json.choices?.[0]?.delta?.content;
+          if (token) {
+            fullText += token;
+            res.write(`data: ${JSON.stringify({ type: "token", token })}\n\n`);
+          }
+        } catch (err) {
+          // JSON ناقص، صبر می‌کنیم تا chunk بعدی
+        }
+      }
+    }
+
+    // اگر استریم بدون [DONE] تمام شد
+    if (fullText.trim()) await Bot.create({ sender: "bot", text: fullText });
+    res.write(`data: ${JSON.stringify({ type: "done", content: fullText })}\n\n`);
+    res.end();
 
   } catch (error) {
-    console.error("AI message error:", error.response?.data || error.message);
-    res.status(500).json({ error: "خطا در پردازش پیام" });
-  }
-});
-
-// پاک کردن همه پیام‌ها برای چت جدید
-router.post("/new-chat", async (req, res) => {
-  try {
-    await User.deleteMany({});
-    await Bot.deleteMany({});
-    res.status(200).json({ message: "چت جدید ایجاد شد." });
-  } catch (err) {
-    res.status(500).json({ error: "خطا در ایجاد چت جدید" });
+    console.error("Streaming error:", error);
+    if (!res.headersSent) {
+      return res.status(500).json({ error: "Internal server error" });
+    }
+    res.write(`data: ${JSON.stringify({ type: "error", error: "Internal server error" })}\n\n`);
+    res.end();
   }
 });
 
